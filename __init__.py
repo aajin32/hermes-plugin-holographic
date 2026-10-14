@@ -23,6 +23,7 @@ from tools.registry import tool_error
 from utils import is_truthy_value
 from . import holographic as hrr
 from . import cold_skills
+from . import topics
 from .history import HistoryTooNew, parse_day
 from .store import DuplicateContentError, MemoryStore
 from .retrieval import FactRetriever
@@ -61,6 +62,10 @@ FACT_STORE_SCHEMA = {
         "  Dates (YYYY-MM-DD) only when the message gives them; never guess.\n"
         "• history {fact_id} · update {fact_id, keywords/tags/category} · list {as_of?} · stats · export · review "
         "(clean-up candidates) · related · contradict.\n"
+        "• Topics group the facts about one matter across sessions: add {content, topic: \"<name>\"} files a fact "
+        "under it, topic_list / topic_show {topic} read them, topic_set {topic, summary} writes what they amount "
+        "to, topic_assign {fact_id, topic} moves an existing one, merge {fact_ids, content, topic?} collapses "
+        "several facts about the same point into one.\n"
         "• enrich — facts stored without keywords: give each some with update {fact_id, keywords}.\n"
         "• entities — known names and aliases · alias {entity, content=<other name>} — one entity, two names "
         "(merges them if both exist).\n"
@@ -71,7 +76,8 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["add", "search", "probe", "related", "reason", "contradict", "update",
                                                   "change", "end", "correct", "revert", "forget", "history", "remove",
-                                                  "list", "stats", "export", "review", "entities", "alias", "enrich"]},
+                                                  "list", "stats", "export", "review", "entities", "alias", "enrich",
+                                                  "topic_list", "topic_show", "topic_set", "topic_assign", "merge"]},
             "content": {"type": "string", "description": "Fact text for 'add' / 'change' / 'correct': one short "
                                                          "standalone sentence."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
@@ -96,6 +102,19 @@ FACT_STORE_SCHEMA = {
                                                           "history."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
+            "topic": {"type": "string", "description": "'add': group the fact with the others about the same matter "
+                                                      "(a short name like the project or the subject) — one thing "
+                                                      "recorded over several conversations lands in one place. "
+                                                      "'topic_show'/'topic_set'/'topic_assign'/'merge': the topic's "
+                                                      "name or id."},
+            "summary": {"type": "string", "description": "'topic_set': what the topic's facts amount to, in a few "
+                                                         "sentences (the facts are what was said; the summary is the "
+                                                         "reading of them)."},
+            "fact_ids": {"type": "array", "items": {"type": "integer"},
+                         "description": "'merge': the ids to collapse into one. The most trusted survives and takes "
+                                        "the new content; the rest are ended (still visible in history)."},
+            "topic_id": {"type": "integer", "description": "'topic_assign': the topic to move the fact into (with "
+                                                           "'fact_id')."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
             "limit": {"type": "integer", "description": "Max results (default: 10, at most 100)."},
@@ -287,7 +306,8 @@ def _results(items: list, key: str = "results") -> str:
 _MAX_LIMIT = 100
 # Agent contexts that may write (contract: skip writes for subagent / cron / flush contexts).
 _WRITER_CONTEXTS = frozenset({"", "primary"})
-_WRITE_ACTIONS = frozenset({"add", "update", "remove", "alias", "change", "end", "correct", "revert", "forget"})
+_WRITE_ACTIONS = frozenset({"add", "update", "remove", "alias", "change", "end", "correct", "revert", "forget",
+                            "topic_set", "topic_assign", "merge"})
 # Context fields Hermes passes to initialize() that a version's source keeps (chat names are not kept: they change).
 _IDENTITY = ("chat_id", "chat_type", "thread_id", "user_id", "user_name")
 # Keywords (document expansion, as doc2query does for lexical search): words a person might ask with that the fact
@@ -333,9 +353,9 @@ _MAX_TRACKED_SESSIONS, _MAX_TRACKED_FACTS = 16, 512
 _MAX_OPEN_STORES = 16  # per-user stores kept open; the least recently used one is closed beyond this
 
 
-def _limit(args: dict) -> int:
+def _limit(args: dict, default: int = 10) -> int:
     """'limit' clamped to 1..100: a negative LIMIT means 'no limit' to SQLite and slices from the end in Python."""
-    return max(1, min(_MAX_LIMIT, int(args.get("limit", 10))))
+    return max(1, min(_MAX_LIMIT, int(args.get("limit", default))))
 
 
 def _tool_handler(actions: dict):
@@ -977,8 +997,11 @@ class HolographicMemoryProvider(MemoryProvider):
                                            + f". If it holds again, change {{fact_id: {past['fact_id']}, content}} "
                                              "keeps one history. Nothing was stored."})
         fact_id, created = self._store.add_fact_status(content, category=category, tags=tags, entities=entities,
-                                                       valid_from=a.get("valid_from"), source=self._source("tool"))
+                                                       valid_from=a.get("valid_from"), source=self._source("tool"),
+                                                       topic_id=self._topic_id(a.get("topic")))
         result: dict = {"fact_id": fact_id, "status": "added" if created else "exists"}
+        if a.get("topic"):
+            result["topic"] = str(a["topic"]).strip()
         if created:
             check = self._retriever.write_check(fact_id)
             result.update({k: v for k, v in check.items() if v})
@@ -992,6 +1015,74 @@ class HolographicMemoryProvider(MemoryProvider):
                 result["hint"] = (f"The user asked to forget this (fact #{gone['fact_id']}, {gone['forgotten_at'][:10]}). "
                                   f"Keep it only if they asked to remember it again; otherwise forget {{fact_id: {fact_id}}}.")
         return json.dumps(result)
+
+    def _topic_id(self, topic) -> int | None:
+        """Resolve a 'topic' argument (name) to an id, creating the topic when new.
+
+        None for a blank value, and also when the topic tables are unavailable
+        (a database written before this feature that a read-only context opened):
+        the fact is stored ungrouped rather than the write failing.
+        """
+        if topic is None or not str(topic).strip():
+            return None
+        try:
+            return topics.get_or_create_topic(self._store, str(topic))
+        except Exception as exc:
+            logger.debug("holographic: topic unavailable, storing without one: %s", exc)
+            return None
+
+    # -- topics -------------------------------------------------------------------------------------------------
+
+    def _topic_list(self, a: dict) -> str:
+        return _results(topics.list_topics(self._store, limit=_limit(a)), key="topics")
+
+    def _topic_show(self, a: dict) -> str:
+        topic = a.get("topic")
+        if topic is None or not str(topic).strip():
+            return tool_error("topic_show requires 'topic' (a name or an id)")
+        found = topics.get_topic_by_name(self._store, str(topic))
+        if found is None and str(topic).isdigit():
+            found = topics.get_topic(self._store, int(topic))
+        if found is None:
+            return tool_error(f"No topic named {topic!r}.")
+        found["facts"] = topics.facts_in_topic(self._store, found["topic_id"], limit=_limit(a, default=50))
+        return json.dumps(found)
+
+    def _topic_set(self, a: dict) -> str:
+        topic = a.get("topic")
+        if topic is None or not str(topic).strip():
+            return tool_error("topic_set requires 'topic' (a name or an id)")
+        if not topics.get_topic_by_name(self._store, str(topic)) and not str(topic).isdigit():
+            # A summary for a topic nobody has facts in would be lost: create it,
+            # so topic_set is usable to name a matter before recording into it.
+            topics.get_or_create_topic(self._store, str(topic))
+        ok = topics.set_summary(self._store, str(topic).strip(), a.get("summary", ""))
+        if not ok:
+            return tool_error(f"No topic named {topic!r}.")
+        return json.dumps({"topic": str(topic).strip(), "status": "summary_set"})
+
+    def _topic_assign(self, a: dict) -> str:
+        if a.get("fact_id") is None:
+            return tool_error("topic_assign requires 'fact_id'")
+        topic = a.get("topic") or a.get("topic_id")
+        if topic is None:
+            return tool_error("topic_assign requires 'topic' (a name) or 'topic_id'")
+        ok = topics.assign_fact(self._store, int(a["fact_id"]), topic)
+        if not ok:
+            return tool_error(f"No fact #{a['fact_id']} to assign.")
+        return json.dumps({"fact_id": int(a["fact_id"]), "topic": str(topic), "status": "assigned"})
+
+    def _merge(self, a: dict) -> str:
+        ids = a.get("fact_ids") or []
+        if len(ids) < 2:
+            return tool_error("merge requires 'fact_ids' with at least two ids")
+        if not (a.get("content") or "").strip():
+            return tool_error("merge requires 'content': the single fact the others collapse into")
+        keep = topics.merge_facts(self._store, [int(i) for i in ids], a["content"].strip(),
+                                  topic=a.get("topic") if a.get("topic") else None)
+        if keep is None:
+            return tool_error("Nothing was merged: the ids must name at least two existing facts.")
+        return json.dumps({"fact_id": keep, "status": "merged", "merged_ids": [int(i) for i in ids]})
 
     def _fact_call(self, a: dict, call, missing: str = ""):
         """Run a history action on a{fact_id}; a fact that does not exist is an answer, not a 'missing argument'."""
@@ -1179,6 +1270,11 @@ class HolographicMemoryProvider(MemoryProvider):
             "entities": lambda self, a: _results(self._store.list_entities(limit=_limit(a)), key="entities"),
             "alias": lambda self, a: json.dumps(self._store.add_alias(a["entity"], a["content"])),
             "enrich": lambda self, a: self._enrich(a),
+            "topic_list": lambda self, a: self._topic_list(a),
+            "topic_show": lambda self, a: self._topic_show(a),
+            "topic_set": lambda self, a: self._topic_set(a),
+            "topic_assign": lambda self, a: self._topic_assign(a),
+            "merge": lambda self, a: self._merge(a),
         }),
         "fact_feedback": lambda self, a: self._feedback(a),
     }

@@ -278,12 +278,20 @@ class MemoryStore(HistoryMixin):
         from hermes_state_wal import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="memory_store.db (holographic)")
         self._conn.executescript(_SCHEMA)
+        # Topics live in their own script so an older build opening this file is
+        # unaffected: it ignores a table it does not know about.
+        from .topics import TOPIC_SCHEMA
+        self._conn.executescript(TOPIC_SCHEMA)
         if "hrr_vector" not in {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}:
             from hermes_cli.sqlite_util import add_column_if_missing
             add_column_if_missing(self._conn, "facts", "hrr_vector", "hrr_vector BLOB")
-        if "embedding_vector" not in {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}:
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
+        if "embedding_vector" not in columns:
             from hermes_cli.sqlite_util import add_column_if_missing
             add_column_if_missing(self._conn, "facts", "embedding_vector", "embedding_vector BLOB")
+        if "topic_id" not in columns:
+            from hermes_cli.sqlite_util import add_column_if_missing
+            add_column_if_missing(self._conn, "facts", "topic_id", "topic_id INTEGER")
         trigger = self._one("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'facts_au'")
         if trigger is not None and "UPDATE OF" not in (trigger["sql"] or "").upper():
             with self._tx():
@@ -459,10 +467,11 @@ class MemoryStore(HistoryMixin):
 
     def add_fact_status(self, content: str, category: str = "general", tags: str = "", *,
                         trust: float | None = None, entities=(), valid_from=None,
-                        source: dict | None = None) -> tuple[int, bool]:
+                        source: dict | None = None, topic_id: int | None = None) -> tuple[int, bool]:
         """(fact_id, created). Links extracted, declared (*entities*) and already known entities and stores the HRR
         vector and the first version (*valid_from*: the date it started to hold, None = unknown; *source*: where it
-        was written) in the same transaction. *trust* overrides the default trust of a new fact."""
+        was written) in the same transaction. *trust* overrides the default trust of a new fact. *topic_id* groups
+        the fact with the others about the same matter (see topics.py); the topic's fact_count follows it."""
         content = (content or "").strip()
         if not content:
             raise ValueError("content must not be empty")
@@ -470,10 +479,14 @@ class MemoryStore(HistoryMixin):
         with self._tx():
             try:
                 fact_id: int = self._write(
-                    "INSERT INTO facts (content, category, tags, trust_score) VALUES (?, ?, ?, ?)",
-                    (content, category, tags, _clamp_trust(self.default_trust if trust is None else trust))).lastrowid  # type: ignore[assignment]
+                    "INSERT INTO facts (content, category, tags, trust_score, topic_id) VALUES (?, ?, ?, ?, ?)",
+                    (content, category, tags, _clamp_trust(self.default_trust if trust is None else trust),
+                     topic_id)).lastrowid  # type: ignore[assignment]
             except sqlite3.IntegrityError:
                 return int(self._one("SELECT fact_id FROM facts WHERE content = ?", (content,))["fact_id"]), False
+            if topic_id is not None:
+                from .topics import _bump_count
+                _bump_count(self, int(topic_id), +1)
             self._link_entities(fact_id, content, entities)
             self._compute_hrr_vector(fact_id, content)
             self._compute_embedding_vector(fact_id, content)
@@ -576,6 +589,12 @@ class MemoryStore(HistoryMixin):
     # -- rows of the current projection (inside a transaction) ---------------------------------------------------
 
     def _delete_fact_row(self, fact_id: int, category: str | None) -> None:
+        # A fact leaving its topic takes one off the topic's count, so fact_count
+        # keeps meaning "facts in the topic" rather than "facts ever added".
+        rows = self.read("SELECT topic_id FROM facts WHERE fact_id = ?", (fact_id,))
+        if rows and rows[0][0] is not None:
+            from .topics import _bump_count
+            _bump_count(self, int(rows[0][0]), -1)
         self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
         self._write("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
         self._drop_orphan_entities()

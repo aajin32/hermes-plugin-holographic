@@ -22,6 +22,7 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 from utils import is_truthy_value
 from . import holographic as hrr
+from . import cold_skills
 from .history import HistoryTooNew, parse_day
 from .store import DuplicateContentError, MemoryStore
 from .retrieval import FactRetriever
@@ -522,6 +523,14 @@ class HolographicMemoryProvider(MemoryProvider):
             context == "cron" and is_truthy_value(self._config.get("cron_writes", True)))
         self._session_id, self._init_error = session_id, ""
         self._home, self._platform = _hermes_home, str(kwargs.get("platform") or "")
+        # Cold skills: index what is parked under skills-cold/ so the store can
+        # answer "is there a skill about this?" at session end. A read-only
+        # context must not write index facts, so it only gets activation checks.
+        if self._writable:
+            try:
+                cold_skills.index_cold_skills(self._store, Path(_hermes_home))
+            except Exception as exc:
+                logger.debug("holographic: cold-skill indexing skipped: %s", exc)
         self._ident = {k: str(kwargs.get(k) or "").strip() for k in _IDENTITY}
         self._author = {}
         self._authors_seen = False
@@ -678,6 +687,9 @@ class HolographicMemoryProvider(MemoryProvider):
             turn = self._turns[key] = self._turns.get(key, 0) + 1
             candidates = self._retriever.search(query, min_trust=self._min_trust, limit=_PREFETCH_CANDIDATES,
                                                  semantic=True)
+            # Cold-skill index facts live in the store so activation can match on
+            # them; they are not facts about the user and must not be injected.
+            candidates = [f for f in candidates if f.get("category") != cold_skills.SKILL_CATEGORY]
             # Recently injected facts are dropped BEFORE the top five are taken, so they leave room for others; so are
             # facts the write filter would refuse today (_recall_problem).
             fresh = [f for f in self._retriever.relevant(query, candidates, self._min_coverage, semantic=True)
@@ -800,6 +812,14 @@ class HolographicMemoryProvider(MemoryProvider):
 
     @_serialized
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        # Cold skills are checked first and regardless of auto_extract: what the
+        # user worked on this session decides whether a parked skill becomes
+        # active again, and that question exists whether or not facts are extracted.
+        if self._store and messages:
+            try:
+                cold_skills.check_cold_skills(self._store, self._retriever, messages, Path(self._home))
+            except Exception as exc:
+                logger.debug("holographic: cold-skill check skipped: %s", exc)
         # User scope extracts per turn in sync_turn (attributed); a whole transcript cannot be attributed safely.
         if self._extracting() and self._scope != "user" and self._store and messages:
             self._auto_extract_facts(messages, self._store, author={})

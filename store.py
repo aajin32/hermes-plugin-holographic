@@ -10,6 +10,7 @@ import unicodedata
 from pathlib import Path
 
 from . import holographic as hrr
+from . import embedding as emb
 from .history import HISTORY_SCHEMA, HistoryMixin, parse_day
 from .text import UNSEGMENTED, analyze, name_keys
 
@@ -34,7 +35,8 @@ CREATE TABLE IF NOT EXISTS facts (
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    hrr_vector      BLOB
+    hrr_vector      BLOB,
+    embedding_vector BLOB
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -231,6 +233,9 @@ class MemoryStore(HistoryMixin):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.default_trust, self.hrr_dim, self._hrr_available = _clamp_trust(default_trust), hrr_dim, hrr._HAS_NUMPY
+        # Neural embeddings are optional: without the model the store keeps its
+        # lexical vectors and search falls back to lexical scoring.
+        self._emb_available = emb.is_available()
         self.tz = tz  # local dates of the history (recorded_on, "today"); None = UTC
         try:  # resolve() so symlinked/relative paths to the same file share ONE connection
             self._key = str(self.db_path.resolve())
@@ -260,6 +265,7 @@ class MemoryStore(HistoryMixin):
                     self.scrub()  # a forget whose file rewrite was blocked last time
                 elif migrate:
                     self._check_vectors()
+                    self._check_embedding_vectors()
                     self.scrub()  # a forget whose file rewrite another process blocked: retried by every writer open
             except BaseException:
                 self.close()  # drop our reference; a broken connection must not stay registered
@@ -275,6 +281,9 @@ class MemoryStore(HistoryMixin):
         if "hrr_vector" not in {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}:
             from hermes_cli.sqlite_util import add_column_if_missing
             add_column_if_missing(self._conn, "facts", "hrr_vector", "hrr_vector BLOB")
+        if "embedding_vector" not in {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}:
+            from hermes_cli.sqlite_util import add_column_if_missing
+            add_column_if_missing(self._conn, "facts", "embedding_vector", "embedding_vector BLOB")
         trigger = self._one("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'facts_au'")
         if trigger is not None and "UPDATE OF" not in (trigger["sql"] or "").upper():
             with self._tx():
@@ -363,6 +372,7 @@ class MemoryStore(HistoryMixin):
             row = self._one("SELECT content FROM facts WHERE fact_id = ?", (fact_id,))
             if row is not None:
                 self._compute_hrr_vector(fact_id, row["content"])
+                self._compute_embedding_vector(fact_id, row["content"])
         self._conn.execute("DELETE FROM memory_banks")
         self._bump()
 
@@ -385,6 +395,7 @@ class MemoryStore(HistoryMixin):
             with self._tx():
                 for row in stale:
                     self._compute_hrr_vector(row["fact_id"], row["content"])
+        self._check_embedding_vectors()
 
     def _sync_hrr_dim(self) -> None:
         """Record hrr_dim; re-encode every vector when the configured dimension differs from the stored one."""
@@ -465,6 +476,7 @@ class MemoryStore(HistoryMixin):
                 return int(self._one("SELECT fact_id FROM facts WHERE content = ?", (content,))["fact_id"]), False
             self._link_entities(fact_id, content, entities)
             self._compute_hrr_vector(fact_id, content)
+            self._compute_embedding_vector(fact_id, content)
             self._invalidate_bank(category)
             if self.history_ready():
                 self._insert_version(fact_id, content, category, tags, valid_from=start, source=source)
@@ -535,6 +547,7 @@ class MemoryStore(HistoryMixin):
                 self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
                 self._link_entities(fact_id, content, [*kept, *(entities or ())])
                 self._compute_hrr_vector(fact_id, content)
+                self._compute_embedding_vector(fact_id, content)
                 self._drop_orphan_entities()
             elif entities:  # declare who the fact is about without rewording it
                 current = self._one("SELECT content FROM facts WHERE fact_id = ?", (fact_id,))["content"]
@@ -591,6 +604,7 @@ class MemoryStore(HistoryMixin):
         self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
         self._link_entities(fact_id, content, [*kept, *(entities or ())])
         self._compute_hrr_vector(fact_id, content)
+        self._compute_embedding_vector(fact_id, content)
         self._drop_orphan_entities()
         self._invalidate_bank(old_category)
         if category != old_category:
@@ -608,6 +622,7 @@ class MemoryStore(HistoryMixin):
             raise DuplicateContentError(int(other["fact_id"]) if other else -1) from None
         self._link_entities(fact_id, version["content"], entities)
         self._compute_hrr_vector(fact_id, version["content"])
+        self._compute_embedding_vector(fact_id, version["content"])
         self._invalidate_bank(version["category"])
 
     def list_facts(self, category: str | None = None, min_trust: float = 0.0, limit: int = 50) -> list[dict]:
@@ -847,6 +862,37 @@ class MemoryStore(HistoryMixin):
         entities = [row["name"] for row in self._conn.execute(_ENTITY_NAMES_SQL, (fact_id,)).fetchall()]
         blob = hrr.phases_to_bytes(hrr.encode_fact(content, entities, self.hrr_dim))
         self._write("UPDATE facts SET hrr_vector = ? WHERE fact_id = ?", (blob, fact_id))
+
+    def _compute_embedding_vector(self, fact_id: int, content: str) -> None:
+        """Compute and store the neural embedding of a fact. No-op when the model is unavailable.
+
+        The vector is written independently of hrr_vector: a store migrated from a
+        build without this column, or a store whose model appeared after some facts
+        were written, gets backfilled by :meth:`_check_embedding_vectors`.
+        """
+        if not self._emb_available:
+            return
+        vec = emb.encode_text(content)
+        if vec is None:
+            return
+        self._write("UPDATE facts SET embedding_vector = ? WHERE fact_id = ?", (emb.vector_to_bytes(vec), fact_id))
+
+    def _check_embedding_vectors(self) -> None:
+        """Backfill embeddings for facts that have none, or whose blob is another model's width."""
+        if not self._emb_available:
+            return
+        dim = emb.get_dim()
+        rows = self._conn.execute(
+            "SELECT fact_id, content FROM facts WHERE embedding_vector IS NULL OR LENGTH(embedding_vector) != ?",
+            (4 * dim,),
+        ).fetchall()
+        if not rows:
+            return
+        with self._tx():
+            for row in rows:
+                self._compute_embedding_vector(row["fact_id"], row["content"])
+        logger.info("holographic: backfilled %d fact embedding(s)", len(rows))
+
 
     def _invalidate_bank(self, category: str | None) -> None:
         """Drop the category's memory bank. Retrieval no longer reads banks; deleting (instead of rebuilding the

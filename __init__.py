@@ -277,6 +277,9 @@ def _load_plugin_config() -> dict:
 
 
 def _results(items: list, key: str = "results") -> str:
+    for item in items:  # drop the internal neural-path marker from anything the agent sees
+        if isinstance(item, dict):
+            item.pop("_semantic_hit", None)
     return json.dumps({key: items, "count": len(items)})
 
 
@@ -460,6 +463,9 @@ class HolographicMemoryProvider(MemoryProvider):
              "default": current("auto_extract", "false"), "choices": ["true", "false"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": current("default_trust", "0.5")},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": current("hrr_dim", "1024")},
+            {"key": "embedding_weight", "description": "Share of the retrieval score the neural embedding gets when the "
+             "local ONNX model is present (0 disables it; the lexical part keeps the rest). Facts without an "
+             "embedding still rank lexically", "default": current("embedding_weight", "0.7")},
             {"key": "mirror_memory_writes", "description": "Also store every built-in memory 'add' (MEMORY.md / USER.md) "
              "as a fact. Off: those entries are already in the system prompt in full",
              "default": current("mirror_memory_writes", "false"), "choices": ["true", "false"]},
@@ -574,6 +580,7 @@ class HolographicMemoryProvider(MemoryProvider):
             logger.error("holographic: %s", self._init_error)
             return None
         retriever = FactRetriever(store=store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
+                                  embedding_weight=float(self._config.get("embedding_weight", 0.7)),
                                   temporal_decay_half_life=int(self._config.get("temporal_decay_half_life", 0)))
         self._stores[key] = (store, retriever)
         while len(self._stores) > _MAX_OPEN_STORES:
@@ -669,10 +676,11 @@ class HolographicMemoryProvider(MemoryProvider):
         try:
             key = f"{session_id or self._session_id or ''}|{self._scope_key or ''}"
             turn = self._turns[key] = self._turns.get(key, 0) + 1
-            candidates = self._retriever.search(query, min_trust=self._min_trust, limit=_PREFETCH_CANDIDATES)
+            candidates = self._retriever.search(query, min_trust=self._min_trust, limit=_PREFETCH_CANDIDATES,
+                                                 semantic=True)
             # Recently injected facts are dropped BEFORE the top five are taken, so they leave room for others; so are
             # facts the write filter would refuse today (_recall_problem).
-            fresh = [f for f in self._retriever.relevant(query, candidates, self._min_coverage)
+            fresh = [f for f in self._retriever.relevant(query, candidates, self._min_coverage, semantic=True)
                      if self._not_recent(key, f, turn) and self._recallable(f)][:_PREFETCH_FACTS]
             have, extra = {f["fact_id"] for f in fresh}, 0
             for entity_id in sorted(self._store.mentioned_entity_ids(query)):

@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from .store import MemoryStore
 
 from . import holographic as hrr
+from . import embedding as emb
 from . import text as _text
 from .history import CLOSED, version_state
 from .text import (CJK_NEGATORS, CLAIM_WORDS, CONTRASTIVE, NEGATORS, UNSEGMENTED, analyze, content_chars,
@@ -43,6 +44,13 @@ _SCAN_PROBE = " OR ".join((_INDONESIAN_PROBE, _GERMAN_PROBE, _DUTCH_PROBE, _TURK
 # A question told to be in one of these languages scans whatever the store holds: the probe words above are a sample,
 # and a store of short facts may have none of them ("Kitabı masada bıraktım." asked as "Kitap nerede?")
 _SCAN_LANGUAGES = frozenset({"id", "de", "tr", "pl", "nl"})
+
+# Cosine similarity a fact must reach to be recalled by the neural path alone
+# (on the raw [-1, 1] scale, before _shift). bge-small-zh puts unrelated
+# sentences around 0.3-0.4 and related ones above 0.6; 0.55 sits in the gap.
+# Only the conversational semantic fallback uses it — the fused path trusts its
+# lexical candidates, which already passed their own tests.
+_EMB_MIN_COS_SIM = 0.55
 
 
 def _scan_language(query: str) -> bool:
@@ -89,10 +97,25 @@ class FactRetriever:
     """Multi-strategy fact retrieval with trust-weighted scoring."""
 
     def __init__(self, store: MemoryStore, temporal_decay_half_life: int = 0,  # days, 0 = disabled
-                 fts_weight: float = 0.4, jaccard_weight: float = 0.3, hrr_weight: float = 0.3, hrr_dim: int = 1024):
+                 fts_weight: float = 0.4, jaccard_weight: float = 0.3, hrr_weight: float = 0.3, hrr_dim: int = 1024,
+                 embedding_weight: float = 0.7):
         self.store, self.half_life, self.hrr_dim = store, temporal_decay_half_life, hrr_dim
         if hrr_weight > 0 and not hrr._HAS_NUMPY:  # redistribute weights without numpy
             fts_weight, jaccard_weight, hrr_weight = 0.6, 0.4, 0.0
+        # Neural embeddings dominate when the model is present: the lexical part
+        # (fts + jaccard + hrr) keeps its relative share of whatever is left.
+        # Without the model the original lexical weights stand untouched.
+        self._emb_available = emb.is_available()
+        if self._emb_available and embedding_weight > 0:
+            self.embedding_weight = min(float(embedding_weight), 1.0)
+            lexical = 1.0 - self.embedding_weight
+            total = fts_weight + jaccard_weight + hrr_weight
+            if total > 0:
+                fts_weight, jaccard_weight, hrr_weight = (fts_weight * lexical / total,
+                                                           jaccard_weight * lexical / total,
+                                                           hrr_weight * lexical / total)
+        else:
+            self.embedding_weight = 0.0
         self.fts_weight, self.jaccard_weight, self.hrr_weight = fts_weight, jaccard_weight, hrr_weight
         # row id -> (text, Analysis), for word-level scans: one cache for the current facts, one for versions
         self._current = _Corpus("facts", (), "facts_fts", "fact_id", {})
@@ -114,7 +137,7 @@ class FactRetriever:
             return None
 
     def search(self, query: str, category: str | None = None, min_trust: float = 0.3, limit: int = 10,
-               corpus: _Corpus | None = None, roots: bool = True) -> list[dict]:
+               corpus: _Corpus | None = None, roots: bool = True, semantic: bool = False) -> list[dict]:
         """FTS5 candidates (limit*3) → Jaccard + HRR rerank → trust weighting → optional temporal decay
         0.5^(age_days / half_life). Returns fact dicts with 'score', sorted desc. *corpus*: the current facts by
         default; search_as_of passes the versions of a date. *roots*=False matches words exactly, as 0.8.0 did (the
@@ -135,6 +158,16 @@ class FactRetriever:
                 candidates[fact[key]] = fact
         for fact in self._scan_candidates(terms, category, min_trust, limit * 3, corpus, exact=not roots, query=query):
             candidates.setdefault(fact[key], fact)  # fills in what FTS cannot see; FTS ranks what it found
+        # Neural fallback, opt-in through ``semantic`` — the conversational recall
+        # paths pass it, the structural ones do not. A question phrased with
+        # different words than any fact (the usual case in Chinese) still finds it
+        # by similarity alone. Off by default because an embedding always has a
+        # nearest neighbour: widening the exact-match (roots=False), probe/related
+        # and as_of paths, whose empty result IS their answer, would break them.
+        if not candidates and semantic and corpus is self._current and self._semantic_fallback_allowed(query):
+            found = self._embedding_candidates(query, category, min_trust, limit)
+            if found:
+                return found
         # BM25 does not see roots: a fact holding "Марина" and "по ночам" ranks with every other fact about Marina for
         # "ночная подработка Марины", and "The walker" matches the prefix "walk"* as fully as a fact with "walk". When
         # any candidate meets any term only through a root (its own or the fact's), all of them are ranked by the
@@ -322,6 +355,8 @@ class FactRetriever:
         # Query vector is loop-invariant; encode lazily on the first candidate that carries an HRR vector
         # so stores whose hrr_vector was never backfilled don't pay for it.
         query_vec = None  # bind(encode_text(query), ROLE_CONTENT): the shape a fact's content is stored in
+        # Same laziness for the neural embedding: encoded once, only if a candidate carries one.
+        query_emb = None
         for fact in candidates:
             jaccard = self._jaccard_similarity(query_tokens, content_stems(f'{fact["content"]} {fact.get("tags") or ""}'))
             hrr_sim = 0.5  # neutral
@@ -330,14 +365,85 @@ class FactRetriever:
                 if query_vec is None:
                     query_vec = hrr.bind(hrr.encode_text(query, self.hrr_dim), self._atom(_ROLE_CONTENT))
                 hrr_sim = _shift(hrr.similarity(query_vec, fact_vec))
-            relevance = self.fts_weight * fact.get("fts_rank", 0.0) + self.jaccard_weight * jaccard + self.hrr_weight * hrr_sim
+            emb_sim = 0.5  # neutral
+            if self.embedding_weight > 0 and fact.get("embedding_vector"):
+                if query_emb is None:
+                    query_emb = emb.encode_text(query)
+                    if query_emb is None:  # the model went away mid-search: fall back for good
+                        self.embedding_weight = 0.0
+                if query_emb is not None:
+                    stored = emb.bytes_to_vector(bytes(fact["embedding_vector"]))
+                    if stored is not None and stored.size == query_emb.size:
+                        emb_sim = emb.shift(emb.cosine_similarity(query_emb, stored))
+            relevance = (self.fts_weight * fact.get("fts_rank", 0.0) + self.jaccard_weight * jaccard
+                         + self.hrr_weight * hrr_sim + self.embedding_weight * emb_sim)
             fact["score"] = relevance * fact["trust_score"]
             if self.half_life > 0:
                 fact["score"] *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
         results = sorted(candidates, key=lambda x: x["score"], reverse=True)[:limit]
         for fact in results:
             fact.pop("hrr_vector", None)  # callers expect JSON-serializable dicts
+            fact.pop("embedding_vector", None)
         return results
+
+    def _semantic_fallback_allowed(self, query: str) -> bool:
+        """May the neural path answer this query when the lexical paths found nothing?
+
+        The lexical layer answers ``[]`` for a reason in several cases — a greeting,
+        a query of nothing but function words (``" the of``), a message with no
+        informative term — and those must stay empty: an embedding always finds its
+        nearest neighbour, so without this gate a "thanks!" would recall a random
+        fact. Same two rules the lexical path uses: the query must carry an
+        informative term, and it must not be a greeting.
+        """
+        if self.embedding_weight <= 0 or not (query or "").strip():
+            return False
+        if is_greeting(query):
+            return False
+        return any(t.fts_ok or t.scan for t in query_terms(query))
+
+    def _embedding_candidates(self, query: str, category: str | None, min_trust: float, limit: int) -> list[dict]:
+        """Facts by neural similarity alone, for when the lexical paths found nothing.
+
+        This is the recall the lexical store cannot do: a Chinese question phrased
+        with different words than the fact. Scored exactly like the fused path
+        (``embedding_weight`` * similarity * trust), so its results interleave with
+        lexical ones rather than outranking them.
+        """
+        if self.embedding_weight <= 0:
+            return []
+        query_emb = emb.encode_text(query)
+        if query_emb is None:
+            return []
+        where = "WHERE embedding_vector IS NOT NULL AND trust_score >= ?"
+        params: list = [min_trust]
+        if category:
+            where += " AND category = ?"
+            params.append(category)
+        rows = self.store.read(f"SELECT {_FACT_COLUMNS}, embedding_vector FROM facts {where}", params)
+        scored = []
+        for row in rows:
+            fact = dict(row)
+            stored = emb.bytes_to_vector(bytes(fact.get("embedding_vector") or b""))
+            if stored is None or stored.size != query_emb.size:
+                continue
+            fact["score"] = self.embedding_weight * emb.shift(emb.cosine_similarity(query_emb, stored)) * fact["trust_score"]
+            if self.half_life > 0:
+                fact["score"] *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
+            # Internal marker: relevant() keeps these (only when it too was called
+            # with semantic=True) instead of testing them against lexical coverage,
+            # which they by construction do not have.
+            fact["_semantic_hit"] = True
+            fact.pop("embedding_vector", None)
+            fact.pop("hrr_vector", None)
+            scored.append(fact)
+        scored.sort(key=lambda f: f["score"], reverse=True)
+        # A floor: an embedding always has a nearest neighbour, so without one a fact
+        # that merely shares the model's idea of "general text" would be recalled.
+        # Scores carry shift(cos) and trust, so the floor is built the same way.
+        floor = self.embedding_weight * emb.shift(_EMB_MIN_COS_SIM) * min_trust
+        kept = [f for f in scored if f["score"] >= floor]
+        return kept[:limit]
 
     def _linked_facts(self, entity_groups: list[list[int]], category: str | None, min_trust: float, limit: int) -> list[dict]:
         """Facts linked to at least one entity of EVERY group (each group = the ids one name resolves to)."""
@@ -531,7 +637,8 @@ class FactRetriever:
         except Exception:
             return 0
 
-    def relevant(self, query: str, candidates: list[dict], min_coverage: float = 0.3) -> list[dict]:
+    def relevant(self, query: str, candidates: list[dict], min_coverage: float = 0.3,
+                 semantic: bool = False) -> list[dict]:
         """Keep the candidates that answer the query, not merely share a word with it.
 
         Coverage = IDF-weighted share of the query's informative terms the fact contains (exact word or same stem).
@@ -540,6 +647,18 @@ class FactRetriever:
         "да, это так") recalls nothing. Order is preserved."""
         if is_greeting(query):  # "good morning", "доброе утро", "早上好": a courtesy, not a question about mornings
             return []
+        # Candidates the neural path already validated carry `_semantic_hit`: they
+        # cleared its similarity floor and informative-term gate, which is what this
+        # lexical coverage test approximates. Only kept when the caller itself asked
+        # for semantic recall (the conversational paths), so the exact-match callers
+        # see exactly the upstream result.
+        if semantic:
+            for f in candidates:
+                f.pop("_semantic_hit", None)
+        else:
+            candidates = [f for f in candidates if not f.pop("_semantic_hit", None)]
+            if not candidates:
+                return []
         grams, zh = query_grams(query or ""), is_chinese(query or "")
         gram_kept = []
         if grams and candidates:

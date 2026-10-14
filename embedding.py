@@ -20,6 +20,7 @@ The directory must hold an ONNX export (``model.onnx`` + ``tokenizer.json`` /
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -70,27 +71,29 @@ def _load() -> None:
         try:
             # Imported lazily: these are the heavy optional dependencies, and a
             # store that never searches semantically should not pay for them.
-            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            import onnxruntime  # noqa: F401
             from transformers import AutoTokenizer
         except Exception as exc:  # ModuleNotFoundError, ImportError, broken install
-            _log_once_unavailable(f"onnxruntime/optimum/transformers unavailable: {exc}")
+            _log_once_unavailable(f"onnxruntime/transformers unavailable: {exc}")
             return
 
         try:
             _tokenizer = AutoTokenizer.from_pretrained(str(_MODEL_DIR))
-            _model = ORTModelForFeatureExtraction.from_pretrained(str(_MODEL_DIR))
+            # Deliberately the raw onnxruntime session, not optimum's wrapper: optimum
+            # pulls torch (and with it the whole CUDA stack, gigabytes) for a model
+            # that runs fine on CPU here.
+            _model = onnxruntime.InferenceSession(
+                str(_MODEL_DIR / "model.onnx"),
+                providers=["CPUExecutionProvider"] if "CPUExecutionProvider" in onnxruntime.get_available_providers()
+                else onnxruntime.get_available_providers(),
+            )
         except Exception as exc:
             _model = None
             _tokenizer = None
             _log_once_unavailable(f"failed to load from {_MODEL_DIR}: {exc}")
             return
 
-        try:
-            hidden = int(_model.config.hidden_size)
-            if hidden > 0:
-                _dim = hidden
-        except Exception:
-            pass
+        _dim = _hidden_size(_MODEL_DIR) or _DEFAULT_DIM
         _available = True
         logger.info("holographic: embedding model loaded from %s (dim=%d)", _MODEL_DIR, _dim)
 
@@ -107,17 +110,43 @@ def get_dim() -> int:
     return _dim
 
 
+def _hidden_size(model_dir: Path) -> int:
+    """``hidden_size`` from the model's config.json, or 0 when it cannot be read."""
+    try:
+        with open(model_dir / "config.json", "r", encoding="utf-8") as fh:
+            return int(json.load(fh).get("hidden_size") or 0)
+    except Exception:
+        return 0
+
+
 def _pool(outputs, attention_mask):
-    """Mean-pool the last hidden state over the attention mask, then L2-normalize."""
+    """Mean-pool the last hidden state over the attention mask, then L2-normalize.
+
+    *outputs* is what the onnxruntime session returns: a list, the token
+    embeddings first (``last_hidden_state``).
+    """
     import numpy as np
 
+    hidden = np.asarray(outputs[0], dtype="float32")
     mask = np.expand_dims(attention_mask, -1).astype("float32")
-    hidden = np.asarray(outputs.last_hidden_state, dtype="float32")
     summed = np.sum(hidden * mask, axis=1)
     counts = np.clip(mask.sum(axis=1), a_min=1e-9, a_max=None)
     vectors = summed / counts
     norms = np.clip(np.linalg.norm(vectors, axis=1, keepdims=True), a_min=1e-9, a_max=None)
     return vectors / norms
+
+
+def _run(texts: list[str]):
+    """Tokenize and run the session; returns (vectors, error)."""
+    import numpy as np
+
+    inputs = _tokenizer(
+        texts, padding=True, truncation=True, max_length=_MAX_LENGTH, return_tensors="np"
+    )
+    wanted = {i.name for i in _model.get_inputs()}
+    feed = {name: np.asarray(value) for name, value in dict(inputs).items() if name in wanted}
+    outputs = _model.run(None, feed)
+    return _pool(outputs, inputs["attention_mask"]), None
 
 
 def encode_text(text: str):
@@ -128,11 +157,8 @@ def encode_text(text: str):
     import numpy as np
 
     try:
-        inputs = _tokenizer(
-            text or "", padding=True, truncation=True, max_length=_MAX_LENGTH, return_tensors="np"
-        )
-        outputs = _model(**inputs)
-        return _pool(outputs, inputs["attention_mask"])[0].astype(np.float32)
+        vectors, _ = _run([text or ""])
+        return vectors[0].astype(np.float32)
     except Exception as exc:
         logger.debug("holographic: embedding encode failed: %s", exc)
         return None
@@ -143,18 +169,9 @@ def encode_batch(texts: list[str]):
     if not is_available():
         return None
 
-    import numpy as np
-
     try:
-        inputs = _tokenizer(
-            [t or "" for t in texts],
-            padding=True,
-            truncation=True,
-            max_length=_MAX_LENGTH,
-            return_tensors="np",
-        )
-        outputs = _model(**inputs)
-        return _pool(outputs, inputs["attention_mask"]).astype(np.float32)
+        vectors, _ = _run([t or "" for t in texts])
+        return vectors
     except Exception as exc:
         logger.debug("holographic: embedding batch encode failed: %s", exc)
         return None

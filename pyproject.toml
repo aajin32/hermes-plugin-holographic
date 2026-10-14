@@ -10,9 +10,12 @@ license = { text = "MIT" }
 dependencies = [
     "numpy>=1.26,<3",
     "snowballstemmer>=2.2,<4",  # word forms in search; pure Python. Polish needs 3.1+ (Hermes pins 3.1.1)
-    "onnxruntime>=1.17,<2",    # local neural embeddings (optional at runtime, installed with the plugin)
-    "transformers>=4.40,<6",   # tokenizer for the ONNX embedding model
-    "optimum[onnxruntime]>=1.18,<3",  # loads the ONNX export of the embedding model
+    # Local neural embeddings. onnxruntime alone runs the model on CPU; optimum is
+    # deliberately NOT a dependency (it pulls torch and the CUDA stack, gigabytes,
+    # for a model that runs fine here). Optional at run time: without the model
+    # directory, search falls back to its lexical scoring.
+    "onnxruntime>=1.17,<2",
+    "transformers>=4.40,<6",  # tokenizer only (AutoTokenizer); no torch needed
 ]
 
 [tool.pytest.ini_options]
